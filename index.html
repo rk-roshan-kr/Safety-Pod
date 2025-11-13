@@ -1,0 +1,245 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Safety Pod — CU Prototype (iOS Bottom Sheet)</title>
+
+  <!-- Leaflet -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css" />
+
+  <!-- Routing machine (optional) -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet-routing-machine@3.2.12/dist/leaflet-routing-machine.css" />
+
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="phone-frame">
+    <!-- MAP -->
+    <div id="map"></div>
+
+    <!-- Floating top -->
+    <div class="floating-top">
+      <button id="profileBtn" class="profile-btn" title="Profile">G</button>
+      <div class="search-container">
+        <span class="search-icon">🔍</span>
+        <input id="searchInput" class="search-input" placeholder="Search destination, building or pod..." />
+      </div>
+      <button id="sosBtn" class="sos-badge">SOS</button>
+    </div>
+
+    <!-- locate -->
+    <button id="locateMeBtn" class="fab" title="Center on me">📍</button>
+
+    <!-- pod info (slide-up compact) -->
+    <div id="podInfoPanel" class="pod-info hidden" aria-hidden="true">
+      <div class="pod-info-inner">
+        <div class="pod-info-header">
+          <div>
+            <div id="piName" class="pi-name">Pod Name</div>
+            <div id="piMeta" class="pi-meta">Members · ETA</div>
+          </div>
+          <button id="piClose" class="btn">✕</button>
+        </div>
+        <div id="piBody" class="pi-body"></div>
+        <div class="pi-actions">
+          <button id="piViewBtn" class="btn">View Details</button>
+          <button id="piJoinBtn" class="btn primary">Join Pod</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Drawer (iOS bottom-sheet style) -->
+    <div id="drawer" class="drawer closed" aria-hidden="true">
+      <div id="drawerBackdrop" class="drawer-backdrop"></div>
+
+      <div id="drawerCard" class="drawer-card" role="dialog" aria-modal="true">
+        <div id="drawerHandle" class="drawer-handle"></div>
+
+        <div class="drawer-header">
+          <div id="drawerTitle">Profile</div>
+          <div class="drawer-tabs">
+            <button class="tab-btn active" data-panel="loginSection">Profile</button>
+            <button class="tab-btn" data-panel="podsSection">Pods</button>
+            <button class="tab-btn" data-panel="alertsSection">Alerts</button>
+          </div>
+        </div>
+
+        <div class="drawer-body">
+          <!-- LOGIN / PROFILE -->
+          <div id="loginSection" class="panel">
+            <div class="panel-header">
+              <h3>Profile</h3>
+              <button id="closeDrawerBtn" class="btn">Close</button>
+            </div>
+
+            <div id="profileArea">
+              <p id="profileGreeting">Not signed in</p>
+              <div style="display:flex;gap:8px;margin-bottom:10px;">
+                <button id="openLoginBtn" class="btn primary">Login / Sign up</button>
+                <button id="setLocationBtn" class="btn">Set My Location</button>
+              </div>
+
+              <h4>Saved Contacts</h4>
+              <div id="contactsList" style="margin-bottom:8px;"></div>
+              <div style="display:flex;gap:8px;align-items:center">
+                <input id="newContactName" placeholder="Name" style="flex:1" />
+                <input id="newContactPhone" placeholder="Phone" style="flex:1" />
+                <button id="addContactBtn" class="btn">Add</button>
+              </div>
+              <p style="font-size:12px;color:#666;margin-top:8px">Contacts will receive SOS notifications (no calls).</p>
+            </div>
+          </div>
+
+          <!-- PODS -->
+          <div id="podsSection" class="panel hidden">
+            <div class="panel-header">
+              <h3>Your Pods</h3>
+              <button id="createPodOpenBtn" class="btn">+ Create Pod</button>
+            </div>
+            <div id="podList" class="pod-list-scroll"></div>
+          </div>
+
+          <!-- ALERTS -->
+          <div id="alertsSection" class="panel hidden">
+            <div class="panel-header"><h3>Alerts</h3></div>
+            <div id="alertsList" style="display:flex;flex-direction:column;gap:12px;padding-bottom:18px;"></div>
+          </div>
+
+          <!-- POD DETAILS (same drawer but separate panel) -->
+          <div id="podDetailsSection" class="panel hidden">
+            <div class="panel-header">
+              <h3 id="podTitle">Pod</h3>
+              <button id="podBackBtn" class="btn">Back</button>
+            </div>
+            <div id="podDetails"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Create Pod Modal -->
+    <div id="createPodModal" class="modal hidden">
+      <div class="modal-backdrop"></div>
+      <div class="modal-card">
+        <h3>Create Pod</h3>
+        <label>Pod name</label>
+        <input id="newPodName" placeholder="Pod name (eg. D6 → Zakir Night Walk)" />
+        <label>Start location</label>
+        <select id="newPodStart"></select>
+        <label>Destination</label>
+        <select id="newPodDest"></select>
+        <label>Departure</label>
+        <select id="newPodDepart">
+          <option value="now">Leave Now</option>
+          <option value="5">In 5 minutes</option>
+          <option value="10" selected>In 10 minutes</option>
+          <option value="15">In 15 minutes</option>
+          <option value="custom">Pick time</option>
+        </select>
+        <input id="newPodDepartCustom" type="time" class="hidden" />
+        <label>Checkpoints (optional)</label>
+        <div id="checkpointContainer" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px"></div>
+        <select id="checkpointAdd"></select>
+        <button id="addCheckpointBtn" class="btn">Add Checkpoint</button>
+        <label>Max members</label>
+        <input id="newPodMax" type="number" min="2" max="12" value="6" />
+        <div style="display:flex;gap:8px;margin-top:12px">
+          <button id="createPodBtn" class="btn primary">Create & Schedule</button>
+          <button id="createCancelBtn" class="btn">Cancel</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Login Modal -->
+    <div id="loginModal" class="modal hidden">
+      <div class="modal-backdrop"></div>
+      <div class="modal-card">
+        <h3>Login / Sign up</h3>
+        <input id="loginName" placeholder="Your name" />
+        <input id="loginPhone" placeholder="Phone (optional)" />
+        <div style="display:flex;gap:8px;margin-top:8px;">
+          <button id="loginBtn" class="btn primary">Continue</button>
+          <button id="guestBtn" class="btn">Use as Guest</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Manual Location Modal -->
+    <div id="manualLocModal" class="modal hidden">
+      <div class="modal-backdrop"></div>
+      <div class="modal-card">
+        <h3>Set My Location</h3>
+        <label>Select campus place</label>
+        <select id="manualLocSelect" style="width:100%;margin-bottom:8px"></select>
+        <p style="text-align:center;margin:8px 0;font-weight:600">OR</p>
+        <label>Enter coordinates</label>
+        <input id="manualLat" placeholder="Latitude" />
+        <input id="manualLng" placeholder="Longitude" />
+        <div style="display:flex;gap:8px;margin-top:12px">
+          <button id="manualLocSaveBtn" class="btn primary">Save</button>
+          <button id="manualLocCancelBtn" class="btn">Cancel</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- SOS Modal -->
+    <div id="sosModal" class="modal hidden">
+      <div class="modal-backdrop" style="background:rgba(0,0,0,0.6)"></div>
+      <div class="modal-card" style="max-width:420px;background:linear-gradient(180deg,#b91c1c,#991b1b);color:#fff;">
+        <div style="text-align:center;padding:10px 6px;">
+          <div style="font-size:46px;margin-bottom:8px">⚠️</div>
+          <h2 style="margin:6px 0;font-size:24px">EMERGENCY</h2>
+          <p id="sosSubtitle" style="opacity:0.95;margin-bottom:12px">Sending alert to Security, Pod & Contacts</p>
+        </div>
+
+        <div id="sosActionArea" style="padding:8px 4px;">
+          <button id="sendSosBtn" class="btn primary" style="width:100%;background:#ff3b30;border-radius:12px;padding:12px;font-weight:900">🚨 SEND SOS</button>
+
+          <div style="display:flex;gap:8px;margin-top:10px">
+            <button id="falseAlertBtn" class="btn" style="flex:1;background:#ffcc00">False Alert</button>
+            <button id="imSafeBtn" class="btn" style="flex:1;background:#10b981;color:#fff">I'm Safe Now</button>
+          </div>
+
+          <div style="display:flex;gap:8px;margin-top:10px">
+            <button id="callPoliceBtn" class="btn" style="flex:1;">Call Police</button>
+            <button id="callSecurityBtn" class="btn" style="flex:1;">Call Security</button>
+          </div>
+
+          <div style="margin-top:12px">
+            <button id="shareLocBtn" class="btn" style="width:100%;">Share Location (WhatsApp)</button>
+          </div>
+
+          <div style="margin-top:14px;font-size:13px;opacity:0.95">
+            <div id="sosTimer">Status: Ready</div>
+            <div id="sosLastLocation" style="margin-top:6px"></div>
+          </div>
+        </div>
+
+      </div>
+    </div>
+
+    <!-- Toast -->
+    <div id="toastContainer" class="toast-container"></div>
+
+    <!-- Bottom nav -->
+    <nav class="bottom-nav">
+      <button class="nav-item" data-page="map">🗺️<span>Map</span></button>
+      <button class="nav-item" data-page="pods">👥<span>Pods</span></button>
+      <button id="navCreate" class="nav-item create" data-page="create">➕</button>
+      <button class="nav-item" data-page="alerts">🔔<span>Alerts</span></button>
+      <button class="nav-item" data-page="profile">⚙️<span>Profile</span></button>
+    </nav>
+  </div>
+
+  <!-- libs -->
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
+  <script src="https://unpkg.com/leaflet-routing-machine@3.2.12/dist/leaflet-routing-machine.min.js"></script>
+
+  <!-- app -->
+  <script src="app.js"></script>
+</body>
+</html>
