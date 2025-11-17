@@ -71,6 +71,7 @@ Built for Chandigarh University campus, optimized for hostel users, based on rea
 * Remove or edit contacts
 * Profile shows login info
 * Guest mode supported
+* Create account option for new users
 
 ---
 
@@ -135,9 +136,9 @@ Built for Chandigarh University campus, optimized for hostel users, based on rea
 * **JavaScript / ES6**
 * **Leaflet.js** (Map & markers)
 * **CSS3** for UI + bottom drawer
-* **LocalStorage** (state, pods, alerts, users)
-* **HTML5**
-* No backend (prototype mode)
+* **Firebase Firestore** (state, pods, alerts, users)
+* **Firebase Authentication** (user login/signup)
+* **HTML5
 
 ---
 
@@ -215,7 +216,6 @@ http://localhost:8000
 
 ## 🧩 Future Enhancements
 
-* Real-time backend (Firebase or Supabase)
 * Live location sharing between members
 * Admin dashboard for campus security
 * Automatic pod matching by route
