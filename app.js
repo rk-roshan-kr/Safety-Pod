@@ -1,10 +1,11 @@
 /* app.js — iOS Bottom-Sheet Style merged app
-    - NEW: Auth is now in a popup modal, not the drawer.
-    - NEW: Drawer is closed by default.
-    - NEW: Full Firestore database integration for Pods, Contacts, and Alerts.
-    - NEW: Real-time data updates with snapshot listeners.
-    - NEW: Production-ready auth UI with Sign Up, Sign In, Google, and Forgot Password.
-    - NEW: Auth state is now the source of truth, no user info in localStorage.
+    - FIX: Scrapped "Dynamic Cluster" logic. App now shows all *other* pod members as individual dots.
+    - FIX: Active Pod routes are no longer cleared when clicking other map elements.
+    - FIX: Re-engineered all pod membership logic to use 'uid' instead of 'name'
+    - NEW: Pod route is now "sticky" and draws immediately on join.
+    - NEW: Live locations now start for 'waiting' pods.
+    - NEW: Active pod marker has a special green pulse.
+    - NEW: Leaders cannot start a pod with 0 members.
 */
 
 // NEW: Use async IIFE to allow top-level await for imports
@@ -13,14 +14,12 @@
 
   /* ---------- MODULE IMPORTS ---------- */
   // All imports must be at the top level
-  const { initializeApp } = await import("https://www.gstatic.com/firebasejs/12.6.0/firebase-app.js");
-  const { getAuth, onAuthStateChanged, updateProfile, sendPasswordResetEmail, signInWithEmailAndPassword, createUserWithEmailAndPassword, GoogleAuthProvider, signInWithPopup, signOut } = await import("https://www.gstatic.com/firebasejs/12.6.0/firebase-auth.js");
-  // NEW: Added getDoc
-  const { getFirestore, collection, addDoc, getDoc, setDoc, onSnapshot, doc, updateDoc, deleteDoc, query, orderBy, serverTimestamp } = await import("https://www.gstatic.com/firebasejs/12.6.0/firebase-firestore.js");
+  const { initializeApp } = await import("https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js");
+  const { getAuth, onAuthStateChanged, updateProfile, sendPasswordResetEmail, signInWithEmailAndPassword, createUserWithEmailAndPassword, GoogleAuthProvider, signInWithPopup, signOut } = await import("https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js");
+  const { getFirestore, collection, addDoc, getDoc, setDoc, onSnapshot, doc, updateDoc, deleteDoc, query, serverTimestamp } = await import("https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js");
 
 
   /* ---------- FIREBASE CONFIG ---------- */
-  // This is your config from the previous message
   const FIREBASE_CONFIG = {
     apiKey: "AIzaSyA444YpSIM28YIeAfoy8qOf-iZxhjVx_0o",
     authDomain: "safety-pod.firebaseapp.com",
@@ -37,8 +36,10 @@
 
   /* ---------- CONFIG ---------- */
   const GREEN_UPDATE_MS = 3000;
+  const LIVE_LOCATION_UPDATE_MS = 5000; 
   const SECURITY_NUMBER = '+917051217431';
   const POLICE_NUMBER = '+917051217431';
+  // REMOVED: POD_CLUSTER_RADIUS_METERS
 
   /* ---------- LOCS (campus) ---------- */
   const LOCS = {
@@ -86,22 +87,27 @@
   /* ---------- app state ---------- */
   const app = {
     map: null, campusLayer: null, podLayer: null,
+    podMembersLayer: null, 
     youMarker: null, manualLocation: null,
-    pods: [], // NEW: Managed by Firestore
-    contacts: [], // NEW: Managed by Firestore
-    alerts: [], // NEW: Managed by Firestore
-    user: null, // NEW: Managed by onAuthStateChanged
+    pods: [], 
+    contacts: [], 
+    alerts: [], 
+    user: null, 
     activePodId: null, currentOpenPodId: null,
     blueRouteLayer: null, orangeHelperLayer: null, greenRouteLayer: null, greenIntervalId: null,
-    lastGeolocateAttempt: 0
+    lastGeolocateAttempt: 0,
+    liveLocationWatcherId: null, 
+    liveLocationListener: null, 
+    podMemberMarkers: {}, 
+    podClusterMarker: null // REMOVED: No longer used, but keeping key
   };
   
-  // NEW: Firestore listener unsubscribe functions
   let podListener = null;
   let contactListener = null;
   let alertListener = null;
 
   /* ---------- Authentication ---------- */
+  // ... (This section is unchanged)
   async function login(email, password) {
     if (!email || !password) {
       toast("Please enter email and password");
@@ -111,7 +117,7 @@
       const userCredential = await signInWithEmailAndPassword(auth, email, password);
       console.log("Logged in:", userCredential.user.uid);
       toast(`Welcome back, ${userCredential.user.displayName || userCredential.user.email}!`);
-      toggleAuthModal(false); // NEW: Close modal on success
+      toggleAuthModal(false); 
     } catch (error) {
       console.error("Login failed:", error.message);
       toast("Login failed: " + getFriendlyAuthError(error.message));
@@ -128,7 +134,6 @@
       await updateProfile(auth.currentUser, {
         displayName: name
       });
-      // NEW: Create a user document in Firestore
       await setDoc(doc(db, "users", userCredential.user.uid), {
         name: name,
         email: email,
@@ -136,7 +141,7 @@
       }, { merge: true });
       console.log("Signed up:", userCredential.user.uid);
       toast(`Welcome, ${name}!`);
-      toggleAuthModal(false); // NEW: Close modal on success
+      toggleAuthModal(false); 
     } catch (error) {
       console.error("Signup failed:", error.message);
       toast("Signup failed: " + getFriendlyAuthError(error.message));
@@ -147,16 +152,15 @@
     try {
       const provider = new GoogleAuthProvider();
       const result = await signInWithPopup(auth, provider);
-      // NEW: Create or update user doc
       await setDoc(doc(db, "users", result.user.uid), {
         name: result.user.displayName,
         email: result.user.email,
         createdAt: serverTimestamp()
-      }, { merge: true }); // Use merge to create or update
+      }, { merge: true }); 
       
       console.log("Logged in with Google:", result.user.uid);
       toast("Welcome, " + result.user.displayName + "!");
-      toggleAuthModal(false); // NEW: Close modal on success
+      toggleAuthModal(false); 
     } catch (error) {
       console.error("Google login failed:", error.message);
       toast("Google login failed: " + getFriendlyAuthError(error.message));
@@ -201,38 +205,42 @@
     return "An unknown error occurred.";
   }
 
-  /* ---------- Firestore Listeners (NEW) ---------- */
+  /* ---------- Firestore Listeners ---------- */
   
   function setupFirestoreListeners(userId) {
-    cleanupFirestoreListeners();
+    cleanupFirestoreListeners(); 
 
     // Listen for Pods
-    //
-    // *** THIS IS THE FIX ***
-    // REMOVED: orderBy("leaveAt", "desc") - this requires a composite index.
-    // We will sort on the client side instead.
     const podsQuery = query(collection(db, "pods"));
     podListener = onSnapshot(podsQuery, (snapshot) => {
       let pods = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-      
-      // NEW: Sort pods on the client side
       try {
         pods.sort((a, b) => {
           const timeA = a.leaveAt.toDate ? a.leaveAt.toDate().getTime() : new Date(a.leaveAt).getTime();
           const timeB = b.leaveAt.toDate ? b.leaveAt.toDate().getTime() : new Date(b.leaveAt).getTime();
-          return timeB - timeA; // Sort descending (newest first)
+          return timeB - timeA;
         });
       } catch (e) {
         console.error("Error sorting pods (likely invalid date):", e);
       }
-      
       app.pods = pods;
       renderPodList();
-      drawPodMarkers();
+      drawPodMarkers(); 
       console.log("Firestore: Pods updated");
-    }, (error) => console.error("Error listening to Pods:", error));
-    // *** END OF FIX ***
 
+      const currentActivePod = app.pods.find(p => p.id === app.activePodId);
+      
+      if (currentActivePod && currentActivePod.status !== 'completed') {
+        startActivePodSession(currentActivePod);
+        drawPlannedRouteForPod(currentActivePod, { fit: false });
+        if (currentActivePod.status === 'in-progress') {
+           startGreenRouteForPod(currentActivePod); 
+        }
+      } else {
+        stopActivePodSession();
+        clearPlannedAndHelperRoutes();
+      }
+    }, (error) => console.error("Error listening to Pods:", error));
 
     // Listen for user's Contacts
     const contactsQuery = query(collection(db, "users", userId, "contacts"));
@@ -243,22 +251,18 @@
     }, (error) => console.error("Error listening to Contacts:", error));
 
     // Listen for Alerts
-    // FIX: Remove orderBy here too, just in case. Client-side sorting is safer.
     const alertsQuery = query(collection(db, "alerts"));
     alertListener = onSnapshot(alertsQuery, (snapshot) => {
       let alerts = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-
-      // NEW: Sort alerts on the client side
       try {
         alerts.sort((a, b) => {
           const timeA = a.time.toDate ? a.time.toDate().getTime() : new Date(a.time).getTime();
           const timeB = b.time.toDate ? b.time.toDate().getTime() : new Date(b.time).getTime();
-          return timeB - timeA; // Sort descending (newest first)
+          return timeB - timeA;
         });
       } catch (e) {
         console.error("Error sorting alerts (likely invalid date):", e);
       }
-
       app.alerts = alerts;
       renderAlertsList();
       console.log("Firestore: Alerts updated");
@@ -273,6 +277,8 @@
     contactListener = null;
     alertListener = null;
     
+    stopActivePodSession(); 
+    
     app.pods = [];
     app.contacts = [];
     app.alerts = [];
@@ -283,7 +289,6 @@
     renderAlertsList();
     console.log("Firestore listeners cleaned up.");
   }
-
 
   /* ---------- utilities ---------- */
   function toast(msg, ms=1600){
@@ -305,7 +310,17 @@
     L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png', { maxZoom:20 }).addTo(app.map);
     app.campusLayer = L.layerGroup().addTo(app.map);
     app.podLayer = L.layerGroup().addTo(app.map);
+    app.podMembersLayer = L.layerGroup().addTo(app.map); 
     drawCampusMarkers();
+    
+    // FIX: Add check for activePodId before clearing routes
+    app.map.on('click', ()=> { 
+      if (!app.activePodId) {
+        clearPlannedAndHelperRoutes(); 
+      }
+      closePodInfo(); 
+      closeDrawer(); 
+    });
   }
 
   /* ---------- campus markers ---------- */
@@ -320,7 +335,10 @@
       const html=`<div class="campus-marker" data-name="${esc(name)}"><div class="emoji">${emoji}</div><div class="label">${esc(name)}</div></div>`;
       const icon = L.divIcon({ html, className:'campus-marker-wrapper', iconSize:[64,64], iconAnchor:[32,32] });
       const m = L.marker([c.lat,c.lng], { icon });
-      m.on('click', ev=>{ ev.originalEvent && ev.originalEvent.stopPropagation && ev.originalEvent.stopPropagation(); openPlaceQuickAction(name); });
+      m.on('click', ev=>{ 
+        ev.originalEvent && ev.originalEvent.stopPropagation && ev.originalEvent.stopPropagation(); 
+        openPlaceQuickAction(name); 
+      });
       app.campusLayer.addLayer(m);
     });
   }
@@ -328,10 +346,15 @@
   /* ---------- pod markers ---------- */
   function drawPodMarkers(){
     if(!app.podLayer) return; app.podLayer.clearLayers();
-    app.pods.forEach(pod=>{ 
+    
+    // Don't draw the active pod's main pin, it's handled by the live session
+    const activePods = app.pods.filter(p => p.status !== 'completed' && p.id !== app.activePodId);
+    
+    activePods.forEach(pod=>{ 
       const spot = LOCS[pod.start] || LOCS[pod.dest] || {lat:30.7672,lng:76.5750};
       const cnt = (pod.members||[]).length || 0;
-      const html = `<div class="custom-marker"><div class="pod-pin">${cnt}</div></div>`;
+      let statusClass = pod.status === 'in-progress' ? 'in-progress' : 'waiting';
+      const html = `<div class="custom-marker ${statusClass}"><div class="pod-pin">${cnt}</div></div>`;
       const icon = L.divIcon({ html, className:'', iconSize:[46,46], iconAnchor:[23,46] });
       const m = L.marker([spot.lat, spot.lng], { icon });
       m.on('click', ev=>{ ev.originalEvent && ev.originalEvent.stopPropagation && ev.originalEvent.stopPropagation(); openPodInfo(pod); });
@@ -343,15 +366,25 @@
   function openPodInfo(pod){
     app.currentOpenPodId = pod.id;
     safeSetText('piName', pod.name); safeSetText('piMeta', `${(pod.members||[]).length}/${pod.max} • ETA ${calcEtaMinutes(pod)} min`);
-    // Handle Firebase Timestamp for leaveAt
     const leaveAtTime = pod.leaveAt.toDate ? pod.leaveAt.toDate() : new Date(pod.leaveAt);
     const b = document.getElementById('piBody'); 
     if(b) b.innerHTML = `<div><strong>From:</strong> ${esc(pod.start)}</div><div style="margin-top:6px"><strong>To:</strong> ${esc(pod.dest)}</div><div style="margin-top:6px"><strong>Checkpoints:</strong> ${(pod.checkpoints||[]).map(esc).join(', ')||'None'}</div><div style="margin-top:8px"><strong>Members:</strong> ${(pod.members||[]).map(esc).join(', ')||'None'}</div><div style="margin-top:8px"><strong>Departure:</strong> ${leaveAtTime.toLocaleString()}</div>`;
     const joinBtn = document.getElementById('piJoinBtn');
     if(joinBtn){ 
-      const isMember = app.user && (pod.members||[]).includes(app.user.name); 
+      const isMember = app.user && (pod.membersUIDs||[]).includes(app.user.uid); 
       joinBtn.style.display='inline-block'; 
       joinBtn.textContent = isMember ? 'Leave' : 'Join'; 
+      
+      if (pod.status === 'completed') {
+        joinBtn.disabled = true;
+        joinBtn.textContent = 'Completed';
+      } else {
+        joinBtn.disabled = false;
+        if (pod.status === 'in-progress' && !isMember) {
+          joinBtn.textContent = 'Join Pod'; 
+        }
+      }
+      
       joinBtn.onclick = ()=> { 
         if(isMember) { 
           leavePod(pod.id); 
@@ -363,10 +396,22 @@
       }; 
     }
     const viewBtn = document.getElementById('piViewBtn'); if(viewBtn){ viewBtn.style.display='inline-block'; viewBtn.onclick = ()=> { closePodInfo(); openDrawer(); showPanel('podDetailsSection'); showPodDetails(pod.id); }; }
-    openPodInfoPanel(); clearPlannedAndHelperRoutes(); drawPlannedRouteForPod(pod, { fit:true }); drawOrangeHelperForPod(pod);
+    openPodInfoPanel(); 
+    const autoFit = pod.id !== app.activePodId;
+    // FIX: Don't clear active route
+    if (!app.activePodId) {
+      clearPlannedAndHelperRoutes();
+    }
+    drawPlannedRouteForPod(pod, { fit: autoFit }); 
+    drawOrangeHelperForPod(pod);
   }
   function openPodInfoPanel(){ const p=document.getElementById('podInfoPanel'); if(!p) return; p.classList.remove('hidden'); setTimeout(()=> p.classList.add('open'),6); p.style.zIndex = 4000; }
-  function closePodInfo(){ const p=document.getElementById('podInfoPanel'); if(!p) return; p.classList.remove('open'); setTimeout(()=> p.classList.add('hidden'),220); if(!app.activePodId || app.activePodId !== app.currentOpenPodId){ clearPlannedAndHelperRoutes(); app.currentOpenPodId = null; } }
+  function closePodInfo(){ const p=document.getElementById('podInfoPanel'); if(!p) return; p.classList.remove('open'); setTimeout(()=> p.classList.add('hidden'),220); 
+    if(app.currentOpenPodId !== app.activePodId) {
+      clearPlannedAndHelperRoutes(); 
+    }
+    app.currentOpenPodId = null; 
+  }
   addListenerIfExist('piClose','click', closePodInfo);
 
   /* ---------- join/leave (NOW USES FIRESTORE) ---------- */
@@ -377,6 +422,12 @@
       return; 
     }
     const pod = app.pods.find(x=>x.id===podId); if(!pod) return;
+    
+    if (pod.status === 'completed') {
+      toast('Cannot join a completed pod.');
+      return;
+    }
+    
     if((pod.members||[]).length >= pod.max){ toast('Pod full'); return; }
     
     if(app.activePodId && app.activePodId !== podId){ 
@@ -388,20 +439,28 @@
     }
     
     const uname = app.user.name; 
+    const uid = app.user.uid;
     const newMembers = [...(pod.members || [])];
-    if(!newMembers.includes(uname)) newMembers.push(uname); 
+    const newMembersUIDs = [...(pod.membersUIDs || [])];
+
+    if(!newMembersUIDs.includes(uid)) {
+      newMembers.push(uname);
+      newMembersUIDs.push(uid);
+    } 
     
     try {
       const podRef = doc(db, "pods", podId);
-      await updateDoc(podRef, { members: newMembers });
+      await updateDoc(podRef, { 
+        members: newMembers,
+        membersUIDs: newMembersUIDs 
+      });
       
       app.activePodId = pod.id; 
-      // NEW: Save activePodId to user's doc in Firestore
       const userRef = doc(db, "users", app.user.uid);
       await setDoc(userRef, { activePodId: pod.id }, { merge: true });
 
-      startGreenRouteForPod(pod); 
       toast('Joined pod: '+pod.name);
+      
     } catch (error) {
       console.error("Error joining pod:", error);
       toast("Error joining pod. Please try again.");
@@ -411,26 +470,40 @@
   async function leavePod(podId){
     const pod = app.pods.find(x=>x.id===podId); if(!pod) return;
     const uname = app.user ? app.user.name : null;
+    const uid = app.user ? app.user.uid : null;
     
     let newMembers = [...(pod.members || [])];
-    if(uname){ 
-      const idx = newMembers.indexOf(uname); 
-      if(idx !== -1) newMembers.splice(idx,1); 
+    let newMembersUIDs = [...(pod.membersUIDs || [])];
+    
+    if(uid){ 
+      const idx = newMembersUIDs.indexOf(uid); 
+      if(idx !== -1) {
+        newMembersUIDs.splice(idx,1);
+        newMembers = newMembers.filter(name => name !== uname);
+      }
+    }
+    
+    if(app.activePodId === podId) {
+      stopActivePodSession();
     }
 
     try {
       const podRef = doc(db, "pods", podId);
-      if (pod.creator === uname && newMembers.length === 0) {
-        await deleteDoc(podRef);
-        toast("Pod deleted.");
+      if (pod.creatorUID === uid && newMembers.length === 0) { 
+        await updateDoc(podRef, { 
+          members: newMembers,
+          membersUIDs: newMembersUIDs
+        });
+        toast("You left the pod.");
       } else {
-        await updateDoc(podRef, { members: newMembers });
+        await updateDoc(podRef, { 
+          members: newMembers,
+          membersUIDs: newMembersUIDs
+        });
       }
       
       if(app.activePodId === podId){ 
         app.activePodId = null; 
-        clearGreenRoute(); 
-        // NEW: Update activePodId in Firestore
         const userRef = doc(db, "users", app.user.uid);
         await setDoc(userRef, { activePodId: null }, { merge: true });
       }
@@ -440,17 +513,189 @@
     }
   }
 
+  // Functions to control pod status
+  async function startPod(podId) {
+    const pod = app.pods.find(p => p.id === podId);
+    if (!pod) return;
+
+    if (!pod.membersUIDs || pod.membersUIDs.length === 0) {
+      toast("Cannot start an empty pod. Invite members first.");
+      return;
+    }
+    
+    const podRef = doc(db, "pods", podId);
+    try {
+      await updateDoc(podRef, { status: 'in-progress' });
+      toast("Pod started!");
+      showPanel('podsSection'); 
+    } catch (e) {
+      console.error("Error starting pod:", e);
+      toast("Error starting pod.");
+    }
+  }
+
+  async function endPod(podId) {
+    const podRef = doc(db, "pods", podId);
+    try {
+      await updateDoc(podRef, { status: 'completed' });
+      toast("Pod completed!");
+      showPanel('podsSection'); 
+      
+      if (app.activePodId === podId) {
+        app.activePodId = null; 
+        const userRef = doc(db, "users", app.user.uid);
+        await setDoc(userRef, { activePodId: null }, { merge: true });
+      }
+
+    } catch (e) {
+      console.error("Error ending pod:", e);
+      toast("Error ending pod.");
+    }
+  }
+
+  /* ---------- NEW: Live Location Session (Simple Logic) ---------- */
+  
+  function startActivePodSession(pod) {
+    if (!app.user) return;
+    if (app.liveLocationWatcherId) return; // Already running
+    
+    console.log("Starting live session for pod:", pod.id);
+    drawPodMarkers(); // Redraw to hide the static pin
+    
+    // 1. Start SHARING our location
+    app.liveLocationWatcherId = navigator.geolocation.watchPosition(
+      async (position) => {
+        const { latitude, longitude } = position.coords;
+        setManualLocation(latitude, longitude, { persist: false }); 
+        
+        try {
+          const locRef = doc(db, "pods", pod.id, "live_locations", app.user.uid);
+          await setDoc(locRef, {
+            lat: latitude,
+            lng: longitude,
+            name: app.user.name,
+            lastUpdate: serverTimestamp()
+          }, { merge: true });
+        } catch (e) {
+          console.error("Error updating live location:", e);
+        }
+      },
+      (error) => {
+        console.error("Geolocation watch error:", error);
+        toast("Live location sharing failed.");
+        stopActivePodSession(); 
+      },
+      { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
+    );
+
+    // 2. Start VIEWING other members' locations
+    const locQuery = collection(db, "pods", pod.id, "live_locations");
+    app.liveLocationListener = onSnapshot(locQuery, (snapshot) => {
+      const seenMarkers = {};
+      
+      snapshot.forEach(doc => {
+        const data = doc.data();
+        const userId = doc.id;
+
+        if (userId === app.user.uid) return; // Don't draw our own dot
+        
+        seenMarkers[userId] = true;
+        const markerHtml = `<div class="pod-member-marker" title="${esc(data.name)}">${esc(data.name.charAt(0))}</div>`;
+        const markerIcon = L.divIcon({ html: markerHtml, className: '', iconSize: [20, 20], iconAnchor: [10, 10] });
+
+        if (app.podMemberMarkers[userId]) {
+          // Marker exists, just move it
+          app.podMemberMarkers[userId].setLatLng([data.lat, data.lng]);
+        } else {
+          // New member, create marker
+          app.podMemberMarkers[userId] = L.marker([data.lat, data.lng], { icon: markerIcon });
+          app.podMemberMarkers[userId].addTo(app.podMembersLayer);
+        }
+      });
+      
+      // Clean up markers for users who left
+      for (const userId in app.podMemberMarkers) {
+        if (!seenMarkers[userId]) {
+          app.podMembersLayer.removeLayer(app.podMemberMarkers[userId]);
+          delete app.podMemberMarkers[userId];
+        }
+      }
+
+    }, (error) => {
+      console.error("Error in live_locations listener:", error);
+      toast("Could not get member locations.");
+    });
+  }
+
+  function stopActivePodSession() {
+    if (!app.liveLocationWatcherId && !app.liveLocationListener) {
+      return; 
+    }
+    console.log("Stopping live session...");
+    
+    if (app.liveLocationWatcherId) {
+      navigator.geolocation.clearWatch(app.liveLocationWatcherId);
+      app.liveLocationWatcherId = null;
+    }
+
+    if (app.liveLocationListener) {
+      app.liveLocationListener(); 
+      app.liveLocationListener = null;
+    }
+    
+    // Clear all straggler dots
+    for (const userId in app.podMemberMarkers) {
+      app.podMembersLayer.removeLayer(app.podMemberMarkers[userId]);
+    }
+    app.podMemberMarkers = {};
+    
+    // Clear the main cluster circle
+    if (app.podClusterMarker) {
+      app.podMembersLayer.removeLayer(app.podClusterMarker);
+      app.podClusterMarker = null;
+    }
+    
+    clearGreenRoute();
+    clearPlannedAndHelperRoutes(); // Clear the blue line
+    
+    if (app.user && app.activePodId) {
+      try {
+        const locRef = doc(db, "pods", app.activePodId, "live_locations", app.user.uid);
+        deleteDoc(locRef);
+      } catch (e) {
+        console.error("Error deleting live location:", e);
+      }
+    }
+    
+    drawPodMarkers(); // Redraw static pins
+  }
+  
+  // REMOVED: calculateClusterCenter, updateClusterMarker, updateStragglerMarkers
+
   /* ---------- routes ---------- */
-  function clearPlannedAndHelperRoutes(){ if(app.blueRouteLayer) try{ app.map.removeLayer(app.blueRouteLayer); }catch(e){} app.blueRouteLayer=null; if(app.orangeHelperLayer) try{ app.map.removeLayer(app.orangeHelperLayer); }catch(e){} app.orangeHelperLayer=null; }
+  function clearPlannedAndHelperRoutes(){ 
+    if(app.blueRouteLayer) {
+      try { app.map.removeLayer(app.blueRouteLayer); } catch(e){} 
+      app.blueRouteLayer=null; 
+    }
+    if(app.orangeHelperLayer) {
+      try { app.map.removeLayer(app.orangeHelperLayer); } catch(e){} 
+      app.orangeHelperLayer=null; 
+    }
+  }
   function clearGreenRoute(){ if(app.greenRouteLayer) try{ app.map.removeLayer(app.greenRouteLayer); }catch(e){} app.greenRouteLayer=null; if(app.greenIntervalId){ clearInterval(app.greenIntervalId); app.greenIntervalId=null; } }
 
-  function calcEtaMinutes(pod){ const s=LOCS[pod.start], d=LOCS[pod.dest]; if(!s||!d) return '—'; const km=haversineDistance(s.lat,s.lng,d.lat,d.lng); const mins=Math.max(1, Math.round((km/5)*60)); return mins; }
-  function haversineDistance(lat1,lon1,lat2,lon2){ const R=6371, toRad=v=>v*Math.PI/180; const dLat=toRad(lat2-lat1), dLon=toRad(lon2-lon1); const a=Math.sin(dLat/2)**2 + Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLon/2)**2; const c=2*Math.atan2(Math.sqrt(a),Math.sqrt(1-a)); return R*c; }
+  function calcEtaMinutes(pod){ const s=LOCS[pod.start], d=LOCS[pod.dest]; if(!s||!d) return '—'; const km=haversineDistance(s.lat,s.lng,d.lat,d.lng) / 1000; const mins=Math.max(1, Math.round((km/5)*60)); return mins; }
+  
+  function haversineDistance(lat1,lon1,lat2,lon2){ const R=6371, toRad=v=>v*Math.PI/180; const dLat=toRad(lat2-lat1), dLon=toRad(lon2-lon1); const a=Math.sin(dLat/2)**2 + Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLon/2)**2; const c=2*Math.atan2(Math.sqrt(a),Math.sqrt(1-a)); return (R*c) * 1000; } // Return meters
 
   function drawPlannedRouteForPod(pod, opts={fit:true}){
     if(!pod) return; const names=[pod.start].concat(pod.checkpoints||[]).concat([pod.dest]);
     const pts = names.map(n=>LOCS[n]).filter(Boolean).map(c=>[c.lat,c.lng]); if(pts.length<2) return;
-    if(app.blueRouteLayer) try{ app.map.removeLayer(app.blueRouteLayer); }catch(e){} app.blueRouteLayer=L.polyline(pts,{color:'#0b84ff',weight:4,dashArray:'8,6',opacity:0.95}).addTo(app.map);
+    
+    if(app.blueRouteLayer) try{ app.map.removeLayer(app.blueRouteLayer); }catch(e){} 
+    
+    app.blueRouteLayer=L.polyline(pts,{color:'#0b84ff',weight:4,dashArray:'8,6',opacity:0.95}).addTo(app.map);
     if(opts.fit){ try{ app.map.fitBounds(app.blueRouteLayer.getBounds(), { padding:[40,110] }); }catch(e){} }
   }
 
@@ -465,6 +710,7 @@
   }
 
   async function startGreenRouteForPod(pod) {
+    // ... (This function is unchanged)
     async function drawGreenOnce(fit = false) {
       if(app.greenRouteLayer){
         try{ app.map.removeLayer(app.greenRouteLayer); }catch(e){}
@@ -492,8 +738,8 @@
     app.greenIntervalId = setInterval(async ()=>{
       const p = app.pods.find(x=>x.id === pod.id);
       if(!p){ clearGreenRoute(); return; }
-      const uname = app.user ? app.user.name : null;
-      if(!uname || !(p.members||[]).includes(uname)){
+      const isMember = app.user && (p.membersUIDs||[]).includes(app.user.uid); 
+      if(!isMember){
         clearGreenRoute(); return;
       }
       await drawGreenOnce(false); 
@@ -501,6 +747,7 @@
   }
 
   /* ---------- Drawer: iOS-style drag & snap ---------- */
+  // ... (This section is unchanged)
   const drawer = document.getElementById('drawer');
   const drawerCard = document.querySelector('.drawer-card');
   const drawerBackdrop = document.querySelector('.drawer-backdrop');
@@ -593,19 +840,42 @@
       list.innerHTML = '<p style="color: #666; text-align: center; padding: 20px 0;">Please sign in to see available pods.</p>';
       return;
     }
-    if (app.pods.length === 0 && app.user) { 
+    const visiblePods = app.pods.filter(p => p.status !== 'completed');
+    
+    if (visiblePods.length === 0 && app.user) { 
       list.innerHTML = '<p style="color: #666; text-align: center; padding: 20px 0;">No active pods. Be the first to create one!</p>';
       return;
     }
     
-    app.pods.forEach(p=>{
-      const isMember = app.user && (p.members||[]).includes(app.user.name);
+    visiblePods.forEach(p=>{
+      const isMember = app.user && (p.membersUIDs||[]).includes(app.user.uid); 
       const div = document.createElement('div'); div.className='pod-card';
+      const status = p.status || 'waiting'; 
+      const statusText = status.replace('-', ' ');
+      const statusBadge = `<span class="status-badge ${status}">${statusText}</span>`;
+      
+      let btnText = 'Join';
+      let btnDisabled = false;
+      if (isMember) {
+        btnText = 'Leave';
+      } else if (status === 'in-progress') {
+        btnText = 'Join'; 
+      } else if (status === 'completed') {
+        btnText = 'Completed';
+        btnDisabled = true;
+      }
+      
       div.innerHTML = `<div style="display:flex;justify-content:space-between;align-items:center">
-        <div style="flex:1;padding-right:8px"><div style="font-weight:800">${esc(p.name)}</div><div style="color:#475569;font-size:13px;margin-top:6px">To: ${esc(p.dest)} · ${p.members.length}/${p.max} · ${calcEtaMinutes(p)} min</div></div>
-        <div style="display:flex;flex-direction:column;gap:8px">
-          <button class="btn" data-action="view" data-id="${p.id}">View</button>
-          <button class="${isMember ? 'btn' : 'btn primary'}" data-action="joinleave" data-id="${p.id}">${isMember ? 'Leave' : 'Join'}</button>
+        <div style="flex:1;padding-right:8px">
+          <div style="font-weight:800; margin-bottom: 4px;">${esc(p.name)}</div>
+          <div style="color:#475569;font-size:13px;margin-top:6px">To: ${esc(p.dest)} · ${p.members.length}/${p.max} · ${calcEtaMinutes(p)} min</div>
+        </div>
+        <div style="display:flex;flex-direction:column;align-items:flex-end;gap:8px">
+          ${statusBadge}
+          <div style="display:flex;gap:8px;">
+            <button class="btn" data-action="view" data-id="${p.id}">View</button>
+            <button class="${isMember ? 'btn' : 'btn primary'}" data-action="joinleave" data-id="${p.id}" ${btnDisabled ? 'disabled' : ''}>${btnText}</button>
+          </div>
         </div></div>`;
       list.appendChild(div);
     });
@@ -614,7 +884,10 @@
         const id = btn.getAttribute('data-id'), action = btn.getAttribute('data-action');
         const pod = app.pods.find(x=>x.id===id); if(!pod) return;
         if(action==='view'){ showPodDetails(id); openDrawerAt(SNAP.HALF); showPanel('podDetailsSection'); }
-        else if(action==='joinleave'){ const isMember = app.user && pod.members && pod.members.includes(app.user.name); if(isMember){ leavePod(id); } else joinPodFlow(id); }
+        else if(action==='joinleave'){ 
+          const isMember = app.user && (pod.membersUIDs||[]).includes(app.user.uid); 
+          if(isMember){ leavePod(id); } else joinPodFlow(id); 
+        }
       });
     });
   }
@@ -622,12 +895,62 @@
   function showPodDetails(id){
     const pod = app.pods.find(x=>x.id===id); if(!pod) return;
     safeSetText('podTitle', pod.name);
-    const details = document.getElementById('podDetails'); if(details){
-      const isMember = app.user && pod.members && pod.members.includes(app.user.name);
-      const leaveAtTime = pod.leaveAt.toDate ? pod.leaveAt.toDate() : new Date(pod.leaveAt);
-      details.innerHTML = `<div><strong>From:</strong> ${esc(pod.start)}</div><div style="margin-top:6px"><strong>To:</strong> ${esc(pod.dest)}</div><div style="margin-top:6px"><strong>Checkpoints:</strong> ${(pod.checkpoints||[]).map(esc).join(', ')||'None'}</div><div style="margin-top:6px"><strong>Members:</strong> ${(pod.members||[]).map(esc).join(', ')||'None'}</div><div style="margin-top:8px"><strong>Departure:</strong> ${leaveAtTime.toLocaleString()}</div><div style="margin-top:12px;display:flex;gap:8px"><button class="btn" id="openInfoFromDetails">Open Info</button><button class="btn primary" id="joinLeaveFromDetails">${isMember ? 'Leave' : 'Join'}</button></div>`;
-      const openBtn=document.getElementById('openInfoFromDetails'); if(openBtn) openBtn.onclick=()=>{ closeDrawer(); setTimeout(()=> openPodInfo(pod),180); };
-      const jl=document.getElementById('joinLeaveFromDetails'); if(jl) jl.onclick=()=>{ const isMember = app.user && pod.members && pod.members.includes(app.user.name); if(isMember) { leavePod(pod.id); } else joinPodFlow(pod.id); };
+    const details = document.getElementById('podDetails'); if(!details) return;
+    
+    const isMember = app.user && (pod.membersUIDs||[]).includes(app.user.uid); 
+    const isLeader = app.user && app.user.uid === pod.creatorUID; 
+    const leaveAtTime = pod.leaveAt.toDate ? pod.leaveAt.toDate() : new Date(pod.leaveAt);
+    
+    let buttonHtml = '';
+    
+    if (isLeader) {
+      if (pod.status === 'waiting') {
+        const hasMembers = pod.members && pod.members.length > 0;
+        buttonHtml = `<button class="btn primary" id="leaderStartPod" ${!hasMembers ? 'disabled' : ''} title="${!hasMembers ? 'Cannot start an empty pod' : ''}">Start Pod Now</button>`;
+      } else if (pod.status === 'in-progress') {
+        buttonHtml = `<button class="btn" id="leaderEndPod" style="background-color: #ff4b4b; color: white;">End Pod</button>`;
+      } else {
+        buttonHtml = `<button class="btn" disabled>Pod Completed</button>`;
+      }
+    } else {
+      if (pod.status === 'completed') {
+        buttonHtml = `<button class="btn" disabled>Pod Completed</button>`;
+      } else {
+        buttonHtml = `<button class="btn primary" id="joinLeaveFromDetails">${isMember ? 'Leave' : 'Join'}</button>`;
+      }
+    }
+    
+    details.innerHTML = `
+      <div><strong>From:</strong> ${esc(pod.start)}</div>
+      <div style="margin-top:6px"><strong>To:</strong> ${esc(pod.dest)}</div>
+      <div style="margin-top:6px"><strong>Status:</strong> <span class="status-badge ${pod.status || 'waiting'}">${pod.status || 'waiting'}</span></div>
+      <div style="margin-top:6px"><strong>Checkpoints:</strong> ${(pod.checkpoints||[]).map(esc).join(', ')||'None'}</div>
+      <div style="margin-top:6px"><strong>Members:</strong> ${(pod.members||[]).map(esc).join(', ')||'None'}</div>
+      <div style="margin-top:8px"><strong>Departure:</strong> ${leaveAtTime.toLocaleString()}</div>
+      <div style="margin-top:12px;display:flex;gap:8px">
+        <button class="btn" id="openInfoFromDetails">Open Info on Map</button>
+        ${buttonHtml}
+      </div>`;
+    
+    addListenerIfExist('openInfoFromDetails', 'click', ()=>{ closeDrawer(); setTimeout(()=> openPodInfo(pod),180); });
+    
+    if (isLeader) {
+      if (pod.status === 'waiting') {
+        addListenerIfExist('leaderStartPod', 'click', () => startPod(pod.id));
+      } else if (pod.status === 'in-progress') {
+        addListenerIfExist('leaderEndPod', 'click', () => endPod(pod.id));
+      }
+    } else {
+      if (pod.status !== 'completed') {
+        addListenerIfExist('joinLeaveFromDetails', 'click', ()=>{ 
+          if (isMember) { 
+            leavePod(pod.id); 
+            showPanel('podsSection');
+          } else {
+            joinPodFlow(pod.id);
+          }
+        });
+      }
     }
   }
 
@@ -660,11 +983,13 @@
     const pod = { 
       name, 
       creator: app.user.name, 
+      creatorUID: app.user.uid, 
       start, 
       dest, 
       checkpoints, 
       leaveAt: new Date(leaveAt), 
-      members: [app.user.name], 
+      members: [], 
+      membersUIDs: [], 
       max: max||6, 
       status:'waiting' 
     };
@@ -672,7 +997,7 @@
     try {
       await addDoc(collection(db, "pods"), pod);
       document.getElementById('createPodModal').classList.add('hidden'); 
-      toast('Pod created');
+      toast('Pod created. You can join it from the list.');
     } catch (error) {
       console.error("Error creating pod:", error);
       toast("Error creating pod. Please try again.");
@@ -680,10 +1005,12 @@
   });
 
   /* ---------- Search ---------- */
+  // ... (This section is unchanged)
   const searchInput = document.getElementById('searchInput');
   if(searchInput) searchInput.addEventListener('keydown', (e)=>{ if(e.key!=='Enter') return; const q=(e.target.value||'').trim().toLowerCase(); if(!q) return; const matchPod = app.pods.find(p=> p.name.toLowerCase().includes(q) || p.dest.toLowerCase().includes(q) || p.start.toLowerCase().includes(q)); if(matchPod){ const loc = LOCS[matchPod.start] || LOCS[matchPod.dest]; if(loc) app.map.setView([loc.lat,loc.lng],17); openPodInfo(matchPod); return; } const matchPlace = Object.keys(LOCS).find(k=>k.toLowerCase().includes(q)); if(matchPlace){ const c=LOCS[matchPlace]; if(c) app.map.setView([c.lat,c.lng],17); openPlaceQuickAction(matchPlace); return; } toast('No match'); });
 
   /* ---------- locate & manual location ---------- */
+  // ... (This section is unchanged)
   addListenerIfExist('locateMeBtn', 'click', async () => { 
     if(app.manualLocation){ app.map.setView([app.manualLocation.lat, app.manualLocation.lng], 17); return; }
     if(app.youMarker && app.youMarker.getLatLng){ const ll=app.youMarker.getLatLng(); app.map.setView([ll.lat,ll.lng],17); return; }
@@ -717,7 +1044,7 @@
   window.setManualLocation = setManualLocation; // Keep for debugging
 
   /* ---------- Login / Profile / Contacts (NEW) ---------- */
-  
+  // ... (This section is unchanged)
   function toggleAuthModal(forceOpen = null) {
     const modal = document.getElementById('authModal');
     if (!modal) return;
@@ -825,12 +1152,20 @@
     safeSetText('piName', name); safeSetText('piMeta','Place');
     const body = document.getElementById('piBody'); if(body) body.innerHTML = `<div style="margin-top:6px">Use as <strong>start</strong> or <strong>destination</strong> in create pod.</div><div style="margin-top:10px;display:flex;gap:8px"><button class="btn" id="place_use_start">Use as start</button><button class="btn" id="place_use_dest">Use as dest</button><button class="btn primary" id="place_center">Center</button></div>`;
     document.getElementById('piJoinBtn') && (document.getElementById('piJoinBtn').style.display = 'none'); document.getElementById('piViewBtn') && (document.getElementById('piViewBtn').style.display='none');
-    openPodInfoPanel(); addOne('#place_use_start', ()=>{ const startSel=document.getElementById('newPodStart'); if(startSel) startSel.value=name; toast('Start set: '+name); }); addOne('#place_use_dest', ()=>{ const destSel=document.getElementById('newPodDest'); if(destSel) destSel.value=name; toast('Destination set: '+name); }); addOne('#place_center', ()=>{ const c=LOCS[name]; if(c) app.map.setView([c.lat,c.lng],17); });
-    clearPlannedAndHelperRoutes(); app.currentOpenPodId=null;
+    openPodInfoPanel(); 
+    addOne('#place_use_start', ()=>{ const startSel=document.getElementById('newPodStart'); if(startSel) startSel.value=name; toast('Start set: '+name); }); 
+    addOne('#place_use_dest', ()=>{ const destSel=document.getElementById('newPodDest'); if(destSel) destSel.value=name; toast('Destination set: '+name); }); 
+    addOne('#place_center', ()=>{ const c=LOCS[name]; if(c) app.map.setView([c.lat,c.lng],17); });
+    
+    // FIX: Add check for activePodId
+    if (!app.activePodId) {
+      clearPlannedAndHelperRoutes(); 
+    }
+    app.currentOpenPodId=null;
   }
 
   /* ---------- Alerts & SOS (NOW USES FIRESTORE) ---------- */
-  
+  // ... (This section is unchanged)
   function renderAlertsList(){ 
     const container=document.getElementById('alertsList'); if(!container) return; 
     container.innerHTML=''; 
@@ -877,6 +1212,7 @@
   async function createAlert({ userName, podName, lat, lng, status='active', note='' }){
     const entry={ 
       user: userName, 
+      creatorUID: app.user.uid, 
       time: serverTimestamp(), 
       pod: podName||null, 
       location: lat && lng ? { lat, lng } : null, 
@@ -926,6 +1262,7 @@
   }
 
   /* ---------- SOS flow ---------- */
+  // ... (This section is unchanged)
   addListenerIfExist('sosBtn','click', ()=>{ 
     if (!app.user) {
       toggleAuthModal(true); 
@@ -978,6 +1315,7 @@
   }
 
   /* ---------- nav items ---------- */
+  // ... (This section is unchanged)
   document.querySelectorAll('.nav-item').forEach(btn=> btn.addEventListener('click', ()=> {
     const page = btn.dataset.page;
     if(page==='map'){ closeDrawer(); closePodInfo(); }
@@ -998,7 +1336,6 @@
     initMap(); 
     console.log("Map initialization attempted");
     
-    // NEW: Auth state listener is the main driver
     onAuthStateChanged(auth, async (user) => { 
       if (user) {
         // User is signed in
@@ -1031,11 +1368,11 @@
           await setManualLocation(app.manualLocation.lat, app.manualLocation.lng, { persist: false });
         } else {
            app.manualLocation = null;
-           if (app.youMarker) app.youMarker.remove();
-           app.youMarker = null;
+           if (app.youMarker) { app.youMarker.remove(); app.youMarker = null; }
         }
-
+        
         setupFirestoreListeners(user.uid); 
+        
       } else {
         // User is signed out
         app.user = null;
@@ -1048,6 +1385,7 @@
         
         cleanupFirestoreListeners(); 
       }
+      
       renderProfile(); 
       renderPodList();
       renderAlertsList();
@@ -1062,7 +1400,6 @@
         if(modal) modal.classList.add('hidden'); 
     }));
     
-    // NEW: Auth Modal Listeners
     addListenerIfExist('profileBtn', 'click', () => toggleAuthModal(true));
     addListenerIfExist('authModalCloseBtn', 'click', () => toggleAuthModal(false));
 
@@ -1104,7 +1441,7 @@
         toast('Location saved');
     });
     
-    // NEW: Wire up all auth buttons
+    // Wire up all auth buttons
     const signInForm = document.getElementById('auth-signin-form');
     const signUpForm = document.getElementById('auth-signup-form');
 
@@ -1118,7 +1455,7 @@
       signUpForm.classList.add('hidden');
     });
     
-    addListenerIfExist('auth-btn-google', 'click', loginWithGoogle);
+    addListenerIfExist('auth-btn-google-signin', 'click', loginWithGoogle);
     addListenerIfExist('auth-btn-google-signup', 'click', loginWithGoogle); 
     
     addListenerIfExist('auth-btn-signout', 'click', appSignOut);
